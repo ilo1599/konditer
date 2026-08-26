@@ -1,0 +1,12 @@
+{
+  "name": "Кондитер — калькуляция тортов",
+  "short_name": "Кондитер",
+  "description": "Калькуляция себестоимости тортов",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff",
+  "icons": [
+    { "src": "assets/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
