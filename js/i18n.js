@@ -63,6 +63,7 @@ const dict = {
     weightNote: 'Коэффициент = нужный вес ÷ вес базового рецепта.',
     apply: 'Применить',
     weightUnknown: 'Сначала заполните состав — вес базового рецепта пока неизвестен.',
+    sizeHelperError: 'Введите оба значения числами.',
 
     extras: 'Дополнительно',
     packagingCost: 'Упаковка, € за торт',
@@ -114,6 +115,7 @@ const dict = {
     ingFormError: 'Заполните название, количество в упаковке и цену.',
     gramsPerPiece: 'Вес 1 шт, г',
     gramsPerPieceHint: 'Нужен только для расчёта веса торта. Напр. яйцо — 55 г. Можно оставить пустым.',
+    gramsPerPieceError: 'Вес 1 шт должен быть числом больше нуля — или оставьте поле пустым.',
 
     // settings
     settingsTitle: 'Настройки',
@@ -232,6 +234,7 @@ const dict = {
     weightNote: 'Multiplier = target weight ÷ base recipe weight.',
     apply: 'Apply',
     weightUnknown: 'Fill in the ingredients first — the base recipe weight is unknown.',
+    sizeHelperError: 'Enter both values as numbers.',
 
     extras: 'Extras',
     packagingCost: 'Packaging, € per cake',
@@ -281,6 +284,7 @@ const dict = {
     ingFormError: 'Please fill in the name, pack size and price.',
     gramsPerPiece: 'Weight of 1 pc, g',
     gramsPerPieceHint: 'Only used to estimate cake weight. E.g. one egg ≈ 55 g. Can be left empty.',
+    gramsPerPieceError: 'Weight of 1 pc must be a number above zero — or leave it empty.',
 
     settingsTitle: 'Settings',
     languageBlock: 'Language',

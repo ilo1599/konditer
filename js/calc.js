@@ -46,6 +46,8 @@ export function unitPrice(ingredient) {
 // Cost of one recipe line at base (multiplier 1).
 // Returns { cost, warning } where warning is null | 'missing' | 'mismatch' | 'price'.
 export function itemCost(item, ingredientsById) {
+  // A freshly added row has no ingredient yet — that is not an error.
+  if (!item.ingredientId) return { cost: 0, warning: null };
   const ing = ingredientsById[item.ingredientId];
   if (!ing) return { cost: 0, warning: 'missing' };
   const iu = UNITS[item.unit];
@@ -167,18 +169,30 @@ export function multiplierFromWeight(baseWeightG, targetWeightG) {
   return b / a;
 }
 
-// Parse a user-entered number: accepts "1,5", "1.5", "30 %", "2,50 €".
+// Parse a user-entered number: accepts "1,5", "1.5", "30 %", "2,50 €",
+// and the grouped forms the app itself prints, such as "1,000" in English.
 // Returns null when the text holds no usable number, so callers can keep
 // the previous value instead of silently substituting 0.
 export function parseNum(value) {
   if (typeof value === 'number') return isFinite(value) ? value : null;
   if (value === null || value === undefined) return null;
-  const s = String(value)
+  let s = String(value)
     .trim()
-    .replace(/[\s ]/g, '')
-    .replace(/[%€$£]/g, '')
-    .replace(',', '.');
+    .replace(/\s/g, '')
+    .replace(/[%\u20ac$\u00a3]/g, '');
   if (s === '') return null;
+
+  const hasComma = s.includes(',');
+  const hasDot = s.includes('.');
+  if (hasComma && hasDot) {
+    // Whichever separator comes last is the decimal one; the other groups digits.
+    const decimal = s.lastIndexOf(',') > s.lastIndexOf('.') ? ',' : '.';
+    s = s.split(decimal === ',' ? '.' : ',').join('').replace(decimal, '.');
+  } else if (hasComma) {
+    // "1,000" / "1,234,567" is digit grouping; "1,5" is a decimal comma.
+    s = /^[+-]?\d{1,3}(,\d{3})+$/.test(s) ? s.split(',').join('') : s.replace(',', '.');
+  }
+
   if (!/^[+-]?\d*\.?\d+$/.test(s)) return null;
   const n = Number(s);
   return isFinite(n) ? n : null;

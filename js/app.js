@@ -244,6 +244,8 @@ function normalizeDraft(rec) {
 
 function ensureDraft(id) {
   if (draft && draft.id === id) return draft;
+  // Switching to another recipe must not drop the previous one's pending edit.
+  if (draft) flushDraft();
   const rec = Store.state.recipes.find((r) => r.id === id);
   draft = rec ? normalizeDraft(rec) : null;
   selectedSizeId = draft?.sizes?.[0]?.id ?? null;
@@ -279,6 +281,36 @@ function flushDraft() {
     saveTimer = null;
     commitDraft();
   }
+}
+
+// ---------------- settings persistence ----------------
+// Settings live directly in Store (no draft). They are debounced like the
+// editor and flushed before the DOM that holds them is replaced, because
+// removing a dirty input never fires `change`.
+
+let settingsTimer = null;
+
+function commitSettingInput(el) {
+  const n = parseNum(el.value);
+  const value = el.value.trim() === '' ? 0 : n === null ? null : Math.max(0, n);
+  // Unparseable text: leave the stored value alone rather than zeroing it.
+  if (value === null) return;
+  if (Store.state.settings[el.dataset.setting] === value) return;
+  Store.saveSettings({ [el.dataset.setting]: value });
+}
+
+function scheduleSettingsSave(el) {
+  clearTimeout(settingsTimer);
+  settingsTimer = setTimeout(() => {
+    settingsTimer = null;
+    commitSettingInput(el);
+  }, 600);
+}
+
+function flushSettings() {
+  clearTimeout(settingsTimer);
+  settingsTimer = null;
+  main.querySelectorAll('[data-setting]').forEach(commitSettingInput);
 }
 
 function flashSaved() {
@@ -320,6 +352,12 @@ function updateActiveTab(routeName) {
 
 function render() {
   const route = parseRoute();
+
+  // Any render discharges a deferred one, whoever triggered it.
+  renderPending = false;
+  clearTimeout(deferredRenderTimer);
+  // A settings field being replaced never fires `change`, so commit it first.
+  flushSettings();
 
   if (Store.fatalError) {
     topnav.hidden = true;
@@ -443,6 +481,8 @@ function warnKey(w) {
 }
 
 function itemCostHtml(item, byId) {
+  // Nothing to price until an ingredient is chosen.
+  if (!item.ingredientId) return '';
   const r = itemCost(item, byId);
   return r.warning
     ? `<span class="item-warn">${esc(t(warnKey(r.warning)))}</span>`
@@ -460,6 +500,12 @@ function itemRowHtml(item, byId) {
   const placeholder = `<option value="" disabled ${!item.ingredientId ? 'selected' : ''}>${esc(
     t('chooseIngredient')
   )}</option>`;
+  // The ingredient was deleted: keep a selected entry for it, otherwise the
+  // browser would display the first real option and contradict the model.
+  const dangling =
+    item.ingredientId && !ing
+      ? `<option value="${esc(item.ingredientId)}" selected disabled>${esc(t('warnMissing'))}</option>`
+      : '';
 
   const units = ing ? compatibleUnits(ing.packUnit) : [item.unit || 'g'];
   const unitOptions = units
@@ -470,7 +516,7 @@ function itemRowHtml(item, byId) {
     <div class="item-row" data-item-id="${esc(item.id)}">
       <select class="select compact item-ing" data-item-field="ingredientId" data-item-id="${esc(item.id)}"
         aria-label="${esc(t('chooseIngredient'))}">
-        ${placeholder}${options}
+        ${placeholder}${dangling}${options}
       </select>
       <input class="input compact item-qty" data-item-field="qty" data-item-id="${esc(item.id)}" inputmode="decimal"
         placeholder="${esc(t('qty'))}" value="${esc(numToInput(item.qty))}" aria-label="${esc(t('qty'))}">
@@ -540,14 +586,15 @@ function summaryHtml(d) {
         t('rowLabor', { n: fmtNum(sel.laborMinutes, lang) })
       )}</span><span class="val">${esc(fmtMoney(sel.laborCost, lang))}</span></div>`
     );
+  const infoRows = [];
   if (sel.weight > 0) {
-    rows.push(
+    infoRows.push(
       `<div class="summary-row"><span class="lbl">${esc(t('rowWeight'))}</span><span class="val">${esc(
         fmtWeight(sel.weight, lang)
       )}</span></div>`
     );
     if (sel.fullCost > 0)
-      rows.push(
+      infoRows.push(
         `<div class="summary-row"><span class="lbl">${esc(t('rowCostPerKg'))}</span><span class="val">${esc(
           fmtMoney(roundCents(sel.fullCost / (sel.weight / 1000)), lang)
         )}</span></div>`
@@ -565,7 +612,7 @@ function summaryHtml(d) {
       <span>${esc(t('costTitle'))}</span>
       <span class="save-indicator" id="save-indicator">✓ ${esc(t('saved'))}</span>
     </div>
-    ${sizes.length > 1 ? `<div class="summary-size-tabs">${chips}</div>` : ''}
+    ${sizes.length > 1 || sel.multiplier !== 1 ? `<div class="summary-size-tabs">${chips}</div>` : ''}
     <div class="summary-rows">${rows.join('')}</div>
     <hr class="summary-divider">
     <div class="summary-total">
@@ -576,6 +623,7 @@ function summaryHtml(d) {
       <span class="lbl">${esc(t('rowPrice'))}</span>
       <span class="val">${esc(fmtMoney(sel.price, lang))}</span>
     </div>
+    ${infoRows.length ? `<div class="summary-rows summary-info">${infoRows.join('')}</div>` : ''}
     ${notes.map((n) => `<div class="summary-note">${esc(n)}</div>`).join('')}`;
 }
 
@@ -791,6 +839,12 @@ function ingredientModal(existing) {
     const price = parseNum($('ing-price').value);
     const unit = $('ing-unit').value;
     const gpp = parseNum($('ing-gpp').value);
+    const gppText = $('ing-gpp').value.trim();
+    if (unit === 'pcs' && gppText !== '' && (gpp === null || gpp <= 0)) {
+      $('ing-error').textContent = t('gramsPerPieceError');
+      $('ing-gpp').focus();
+      return;
+    }
     if (!name || qty === null || qty <= 0 || price === null || price < 0) {
       $('ing-error').textContent = t('ingFormError');
       if (!name) $('ing-name').focus();
@@ -999,11 +1053,11 @@ function sizeHelperDiameter() {
     const next = parseNum(m.scrim.querySelector('#dia-new').value);
     const k = multiplierFromDiameter(base, next);
     if (k === null) {
-      m.scrim.querySelector('#dia-error').textContent = t('ingFormError');
+      m.scrim.querySelector('#dia-error').textContent = t('sizeHelperError');
       return;
     }
     m.close({
-      multiplier: Math.round(k * 100) / 100,
+      multiplier: Math.max(0.01, Math.round(k * 100) / 100),
       label: `${fmtNum(next, getLang())} ${getLang() === 'ru' ? 'см' : 'cm'}`,
     });
   });
@@ -1041,14 +1095,14 @@ function sizeHelperWeight(baseWeightG) {
       const target = parseNum(m.scrim.querySelector('#wt-target').value);
       const k = multiplierFromWeight(baseWeightG, target);
       if (k === null) {
-        m.scrim.querySelector('#wt-error').textContent = t('ingFormError');
+        m.scrim.querySelector('#wt-error').textContent = t('sizeHelperError');
         return;
       }
       const label =
         target >= 1000
           ? `${fmtNum(target / 1000, lang)} ${lang === 'ru' ? 'кг' : 'kg'}`
           : `${fmtNum(target, lang)} ${lang === 'ru' ? 'г' : 'g'}`;
-      m.close({ multiplier: Math.round(k * 100) / 100, label });
+      m.close({ multiplier: Math.max(0.01, Math.round(k * 100) / 100), label });
     });
   }
   return m.promise;
@@ -1169,9 +1223,11 @@ function pickImportFile() {
 // ---------------- migration check ----------------
 
 let migrationChecked = false;
+let migrationDeferred = false; // "ask later" — stays quiet until the next session
 
 async function maybeOfferMigration() {
-  if (migrationChecked) return;
+  if (migrationChecked || migrationDeferred) return;
+  if (Store.fatalError) return;
   if (Store.mode !== 'cloud' || !Store.user) return;
   // Wait until every collection has reported, or an empty first snapshot
   // would look like "the cloud is empty" and offer to overwrite real data.
@@ -1206,8 +1262,9 @@ async function maybeOfferMigration() {
   } else if (choice === 'no') {
     Store.dismissLocalData();
   } else {
-    // Dismissed — ask again next session rather than discarding the data.
-    migrationChecked = false;
+    // Dismissed — keep the data and ask again next session, not on the very
+    // next store write.
+    migrationDeferred = true;
   }
   render();
 }
@@ -1249,7 +1306,7 @@ const actions = {
       id: uid(),
       ingredientId: '',
       qty: 0,
-      unit: first ? compatibleUnits(first.packUnit)[0] : 'g',
+      unit: (first && compatibleUnits(first.packUnit)[0]) || 'g',
     });
     commitDraft();
     render();
@@ -1455,7 +1512,10 @@ main.addEventListener('input', (e) => {
     }
     scheduleSave();
     updateComputed();
+    return;
   }
+
+  if (el.dataset.setting) scheduleSettingsSave(el);
 });
 
 // selects & settings commit on change
@@ -1470,7 +1530,7 @@ main.addEventListener('change', (e) => {
       const ing = ingredientsById()[el.value];
       if (ing) {
         const units = compatibleUnits(ing.packUnit);
-        if (!units.includes(item.unit)) item.unit = units[0];
+        if (!units.includes(item.unit)) item.unit = units[0] || 'g';
       }
       commitDraft();
       render();
@@ -1483,11 +1543,9 @@ main.addEventListener('change', (e) => {
   }
 
   if (el.dataset.setting) {
-    const n = parseNum(el.value);
-    const value = el.value.trim() === '' ? 0 : n === null ? null : Math.max(0, n);
-    // Unparseable text: leave the stored value alone rather than zeroing it.
-    if (value === null) return;
-    Store.saveSettings({ [el.dataset.setting]: value });
+    clearTimeout(settingsTimer);
+    settingsTimer = null;
+    commitSettingInput(el);
   }
 });
 
@@ -1495,6 +1553,7 @@ main.addEventListener('change', (e) => {
 
 let bootRendered = false;
 let renderPending = false;
+let deferredRenderTimer = null;
 
 function isTypingInMain() {
   const ae = document.activeElement;
@@ -1524,18 +1583,22 @@ function onStoreChange() {
 document.addEventListener('focusout', () => {
   if (!renderPending) return;
   // Let focus settle: it may just be moving to another field.
-  setTimeout(() => {
-    if (renderPending && !isTypingInMain()) {
-      renderPending = false;
+  clearTimeout(deferredRenderTimer);
+  deferredRenderTimer = setTimeout(() => {
+    if (renderPending && !isTypingInMain() && !activeModal) {
       flushDraft();
-      render();
+      render(); // clears renderPending itself
     }
   }, 150);
 });
 
-// Leaving the editor must not lose a pending debounced save.
-window.addEventListener('beforeunload', flushDraft);
-window.addEventListener('pagehide', flushDraft);
+// Leaving the page must not lose a pending debounced save.
+function flushAll() {
+  flushDraft();
+  flushSettings();
+}
+window.addEventListener('beforeunload', flushAll);
+window.addEventListener('pagehide', flushAll);
 
 window.addEventListener('hashchange', () => {
   // A modal belongs to the view that opened it.
@@ -1547,11 +1610,14 @@ applyStaticI18n();
 Store.init({
   onChange: onStoreChange,
   onAuthChange: () => {
+    // An external sign-out (token expiry) must not drop a pending edit.
+    flushAll();
     migrationChecked = false;
+    migrationDeferred = false;
     draft = null;
     render();
   },
   onError: (kind) => {
-    if (kind === 'save') showToast(t('saveError'));
+    showToast(t(kind === 'load' ? 'loadError' : 'saveError'));
   },
 });

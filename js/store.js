@@ -11,6 +11,8 @@
 // Failures surface through the onError callback.
 // ============================================================
 
+import { UNITS } from './calc.js';
+
 const LS_KEY = 'konditer-data-v1';
 const FIREBASE_VER = '10.12.2';
 const SOURCES = ['ingredients', 'recipes', 'settings'];
@@ -62,7 +64,8 @@ export const Store = {
   _cb: { onChange: () => {}, onAuthChange: () => {}, onError: () => {} },
   _fb: null, // { db, auth, fns } when in cloud mode
   _unsubs: [],
-  _arrived: new Set(),
+  _arrived: new Set(), // a snapshot (cache or server) has been seen
+  _fromServer: new Set(), // a snapshot has been confirmed by the backend
 
   async init(callbacks = {}) {
     Object.assign(this._cb, callbacks);
@@ -123,6 +126,7 @@ export const Store = {
         } else {
           this._unsubscribeAll();
           this.state = emptyState();
+          this.fatalError = null;
           this.ready = true; // ready to show the sign-in screen
         }
         this._cb.onAuthChange(this.user);
@@ -141,8 +145,16 @@ export const Store = {
     const { collection, doc, onSnapshot } = fsMod;
 
     this._arrived = new Set();
-    const arrived = (source) => {
+    this._fromServer = new Set();
+    this.fatalError = null;
+
+    const arrived = (source, snap) => {
       this._arrived.add(source);
+      // A cached snapshot is enough to show the UI, but not to conclude
+      // anything about what the account actually contains.
+      if (snap && snap.metadata && snap.metadata.fromCache === false) {
+        this._fromServer.add(source);
+      }
       // Every source must report once before the app is considered loaded,
       // including empty collections (onSnapshot fires with an empty snapshot).
       if (SOURCES.every((s) => this._arrived.has(s))) this.ready = true;
@@ -151,9 +163,10 @@ export const Store = {
 
     const onErr = (source) => (err) => {
       console.error(`Firestore listener failed (${source})`, err);
-      // Mark arrived so the UI leaves the spinner, and surface the failure.
-      this.fatalError = 'load';
-      arrived(source);
+      // Leave the spinner and keep whatever other sources loaded; report the
+      // failure as a message rather than replacing the whole interface.
+      this._cb.onError('load', err);
+      arrived(source, null);
     };
 
     this._unsubs.push(
@@ -161,7 +174,7 @@ export const Store = {
         collection(db, 'users', uid, 'ingredients'),
         (snap) => {
           this.state.ingredients = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-          arrived('ingredients');
+          arrived('ingredients', snap);
         },
         onErr('ingredients')
       )
@@ -171,7 +184,7 @@ export const Store = {
         collection(db, 'users', uid, 'recipes'),
         (snap) => {
           this.state.recipes = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-          arrived('recipes');
+          arrived('recipes', snap);
         },
         onErr('recipes')
       )
@@ -181,7 +194,7 @@ export const Store = {
         doc(db, 'users', uid, 'meta', 'settings'),
         (snap) => {
           this.state.settings = { ...DEFAULT_SETTINGS, ...(snap.data() || {}) };
-          arrived('settings');
+          arrived('settings', snap);
         },
         onErr('settings')
       )
@@ -192,12 +205,16 @@ export const Store = {
     this._unsubs.forEach((u) => u());
     this._unsubs = [];
     this._arrived = new Set();
+    this._fromServer = new Set();
   },
 
-  // True only when every collection for this user has loaded at least once.
+  // True only when every collection has been confirmed by the SERVER.
+  // Offline, Firestore delivers empty cached snapshots immediately; treating
+  // those as "the account is empty" would let the migration prompt overwrite
+  // real cloud data with whatever happens to be in this browser.
   isFullyLoaded() {
     if (this.mode !== 'cloud') return true;
-    return SOURCES.every((s) => this._arrived.has(s));
+    return SOURCES.every((s) => this._fromServer.has(s));
   },
 
   // ---------------- auth ----------------
@@ -239,8 +256,19 @@ export const Store = {
   },
 
   _commit(cloudWrite) {
-    if (this.mode === 'cloud' && this.user) this._fire(cloudWrite());
-    else this._persistLocal();
+    if (this.mode === 'cloud' && this.user) {
+      // The Firestore SDK validates eagerly and throws synchronously on bad
+      // data or a bad document id — catch that here so it cannot escape into
+      // a debounce timer where nothing would report it.
+      try {
+        this._fire(cloudWrite());
+      } catch (err) {
+        console.error('Firestore write rejected', err);
+        this._cb.onError('save', err);
+      }
+    } else {
+      this._persistLocal();
+    }
     this._cb.onChange();
   },
 
@@ -314,7 +342,13 @@ export const Store = {
       r && typeof r === 'object' && typeof r.id === 'string' && r.id.trim() !== '' &&
       // Firestore document ids may not contain slashes.
       !r.id.includes('/');
-    return data.ingredients.every(validId) && data.recipes.every(validId);
+    const num = (v) => typeof v === 'number' && isFinite(v);
+    // An ingredient with an unknown unit would later yield an undefined item
+    // unit, which Firestore rejects — reject the file instead.
+    const validIngredient = (i) =>
+      validId(i) && Object.prototype.hasOwnProperty.call(UNITS, i.packUnit) &&
+      num(i.packQty) && num(i.packPrice);
+    return data.ingredients.every(validIngredient) && data.recipes.every(validId);
   },
 
   async importData(data) {
