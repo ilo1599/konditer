@@ -5,19 +5,15 @@
 //   local — localStorage (no Firebase config present)
 //   cloud — Firestore under users/{uid}/… with offline persistence
 //
-// Public surface:
-//   Store.init(callbacks) → resolves when the first state is ready
-//   Store.mode ('local' | 'cloud'), Store.user
-//   Store.state = { ingredients: [], recipes: [], settings: {} }
-//   Store.saveIngredient / deleteIngredient / saveRecipe / deleteRecipe
-//   Store.saveSettings(partial)
-//   Store.signIn(email, pass) / signOut() / resetPassword(email)
-//   Store.exportData() / importData(obj)
-//   Store.hasLocalData() / migrateLocalToCloud()
+// Cloud writes are optimistic: local state changes and the UI updates
+// immediately, and the Firestore promise is NOT awaited by callers —
+// offline, those promises stay pending until connectivity returns.
+// Failures surface through the onError callback.
 // ============================================================
 
 const LS_KEY = 'konditer-data-v1';
 const FIREBASE_VER = '10.12.2';
+const SOURCES = ['ingredients', 'recipes', 'settings'];
 
 export const DEFAULT_SETTINGS = { laborRate: 0, marginPct: 0, currency: 'EUR' };
 
@@ -60,18 +56,27 @@ export const Store = {
   mode: 'local',
   user: null,
   ready: false,
+  fatalError: null, // 'cdn' | 'load' — shown as a full-screen message
   state: emptyState(),
 
-  _cb: { onChange: () => {}, onAuthChange: () => {} },
+  _cb: { onChange: () => {}, onAuthChange: () => {}, onError: () => {} },
   _fb: null, // { db, auth, fns } when in cloud mode
   _unsubs: [],
+  _arrived: new Set(),
 
   async init(callbacks = {}) {
     Object.assign(this._cb, callbacks);
 
     if (window.FIREBASE_CONFIG) {
       this.mode = 'cloud';
-      await this._initCloud();
+      try {
+        await this._initCloud();
+      } catch (err) {
+        console.error('Firebase init failed', err);
+        this.fatalError = 'cdn';
+        this.ready = true;
+        this._cb.onChange();
+      }
     } else {
       this.mode = 'local';
       this.state = readLocal() || emptyState();
@@ -110,14 +115,18 @@ export const Store = {
       authMod.onAuthStateChanged(auth, (user) => {
         this.user = user || null;
         if (user) {
+          // Not ready until this user's data has actually loaded — the
+          // migration prompt must never see an empty state as "cloud is empty".
+          this.ready = false;
+          this.state = emptyState();
           this._subscribe(user.uid);
         } else {
           this._unsubscribeAll();
           this.state = emptyState();
-          this.ready = true;
-          this._cb.onChange();
+          this.ready = true; // ready to show the sign-in screen
         }
         this._cb.onAuthChange(this.user);
+        this._cb.onChange();
         if (first) {
           first = false;
           resolve();
@@ -131,36 +140,64 @@ export const Store = {
     const { db, fsMod } = this._fb;
     const { collection, doc, onSnapshot } = fsMod;
 
-    let got = 0;
-    const arrived = () => {
-      got += 1;
-      if (got >= 3) this.ready = true;
+    this._arrived = new Set();
+    const arrived = (source) => {
+      this._arrived.add(source);
+      // Every source must report once before the app is considered loaded,
+      // including empty collections (onSnapshot fires with an empty snapshot).
+      if (SOURCES.every((s) => this._arrived.has(s))) this.ready = true;
       this._cb.onChange();
     };
 
+    const onErr = (source) => (err) => {
+      console.error(`Firestore listener failed (${source})`, err);
+      // Mark arrived so the UI leaves the spinner, and surface the failure.
+      this.fatalError = 'load';
+      arrived(source);
+    };
+
     this._unsubs.push(
-      onSnapshot(collection(db, 'users', uid, 'ingredients'), (snap) => {
-        this.state.ingredients = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-        arrived();
-      })
+      onSnapshot(
+        collection(db, 'users', uid, 'ingredients'),
+        (snap) => {
+          this.state.ingredients = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+          arrived('ingredients');
+        },
+        onErr('ingredients')
+      )
     );
     this._unsubs.push(
-      onSnapshot(collection(db, 'users', uid, 'recipes'), (snap) => {
-        this.state.recipes = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-        arrived();
-      })
+      onSnapshot(
+        collection(db, 'users', uid, 'recipes'),
+        (snap) => {
+          this.state.recipes = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+          arrived('recipes');
+        },
+        onErr('recipes')
+      )
     );
     this._unsubs.push(
-      onSnapshot(doc(db, 'users', uid, 'meta', 'settings'), (snap) => {
-        this.state.settings = { ...DEFAULT_SETTINGS, ...(snap.data() || {}) };
-        arrived();
-      })
+      onSnapshot(
+        doc(db, 'users', uid, 'meta', 'settings'),
+        (snap) => {
+          this.state.settings = { ...DEFAULT_SETTINGS, ...(snap.data() || {}) };
+          arrived('settings');
+        },
+        onErr('settings')
+      )
     );
   },
 
   _unsubscribeAll() {
     this._unsubs.forEach((u) => u());
     this._unsubs = [];
+    this._arrived = new Set();
+  },
+
+  // True only when every collection for this user has loaded at least once.
+  isFullyLoaded() {
+    if (this.mode !== 'cloud') return true;
+    return SOURCES.every((s) => this._arrived.has(s));
   },
 
   // ---------------- auth ----------------
@@ -182,75 +219,78 @@ export const Store = {
 
   // ---------------- writes ----------------
 
+  // Fire a Firestore write without blocking the UI. Offline, the promise
+  // stays pending (the write is queued locally and syncs later), so awaiting
+  // it would freeze the interface — exactly what offline mode must avoid.
+  _fire(promise) {
+    Promise.resolve(promise).catch((err) => {
+      console.error('Firestore write failed', err);
+      this._cb.onError('save', err);
+    });
+  },
+
   _persistLocal() {
-    writeLocal(this.state);
+    try {
+      writeLocal(this.state);
+    } catch (err) {
+      console.error('localStorage write failed', err);
+      this._cb.onError('save', err);
+    }
+  },
+
+  _commit(cloudWrite) {
+    if (this.mode === 'cloud' && this.user) this._fire(cloudWrite());
+    else this._persistLocal();
     this._cb.onChange();
   },
 
-  async saveIngredient(ing) {
+  saveIngredient(ing) {
     const idx = this.state.ingredients.findIndex((i) => i.id === ing.id);
     if (idx >= 0) this.state.ingredients[idx] = ing;
     else this.state.ingredients.push(ing);
-
-    if (this.mode === 'cloud' && this.user) {
+    this._commit(() => {
       const { db, fsMod } = this._fb;
       const { id, ...data } = ing;
-      this._cb.onChange();
-      await fsMod.setDoc(fsMod.doc(db, 'users', this.user.uid, 'ingredients', id), data);
-    } else {
-      this._persistLocal();
-    }
+      return fsMod.setDoc(fsMod.doc(db, 'users', this.user.uid, 'ingredients', id), data);
+    });
   },
 
-  async deleteIngredient(id) {
+  deleteIngredient(id) {
     this.state.ingredients = this.state.ingredients.filter((i) => i.id !== id);
-    if (this.mode === 'cloud' && this.user) {
+    this._commit(() => {
       const { db, fsMod } = this._fb;
-      this._cb.onChange();
-      await fsMod.deleteDoc(fsMod.doc(db, 'users', this.user.uid, 'ingredients', id));
-    } else {
-      this._persistLocal();
-    }
+      return fsMod.deleteDoc(fsMod.doc(db, 'users', this.user.uid, 'ingredients', id));
+    });
   },
 
-  async saveRecipe(recipe) {
+  saveRecipe(recipe) {
     const idx = this.state.recipes.findIndex((r) => r.id === recipe.id);
     if (idx >= 0) this.state.recipes[idx] = recipe;
     else this.state.recipes.push(recipe);
-
-    if (this.mode === 'cloud' && this.user) {
+    this._commit(() => {
       const { db, fsMod } = this._fb;
       const { id, ...data } = recipe;
-      this._cb.onChange();
-      await fsMod.setDoc(fsMod.doc(db, 'users', this.user.uid, 'recipes', id), data);
-    } else {
-      this._persistLocal();
-    }
+      return fsMod.setDoc(fsMod.doc(db, 'users', this.user.uid, 'recipes', id), data);
+    });
   },
 
-  async deleteRecipe(id) {
+  deleteRecipe(id) {
     this.state.recipes = this.state.recipes.filter((r) => r.id !== id);
-    if (this.mode === 'cloud' && this.user) {
+    this._commit(() => {
       const { db, fsMod } = this._fb;
-      this._cb.onChange();
-      await fsMod.deleteDoc(fsMod.doc(db, 'users', this.user.uid, 'recipes', id));
-    } else {
-      this._persistLocal();
-    }
+      return fsMod.deleteDoc(fsMod.doc(db, 'users', this.user.uid, 'recipes', id));
+    });
   },
 
-  async saveSettings(partial) {
+  saveSettings(partial) {
     this.state.settings = { ...this.state.settings, ...partial };
-    if (this.mode === 'cloud' && this.user) {
+    this._commit(() => {
       const { db, fsMod } = this._fb;
-      this._cb.onChange();
-      await fsMod.setDoc(
+      return fsMod.setDoc(
         fsMod.doc(db, 'users', this.user.uid, 'meta', 'settings'),
         this.state.settings
       );
-    } else {
-      this._persistLocal();
-    }
+    });
   },
 
   // ---------------- backup ----------------
@@ -267,13 +307,14 @@ export const Store = {
   },
 
   validateImport(data) {
-    return (
-      data &&
-      typeof data === 'object' &&
-      data.app === 'konditer' &&
-      Array.isArray(data.ingredients) &&
-      Array.isArray(data.recipes)
-    );
+    if (!data || typeof data !== 'object') return false;
+    if (data.app !== 'konditer') return false;
+    if (!Array.isArray(data.ingredients) || !Array.isArray(data.recipes)) return false;
+    const validId = (r) =>
+      r && typeof r === 'object' && typeof r.id === 'string' && r.id.trim() !== '' &&
+      // Firestore document ids may not contain slashes.
+      !r.id.includes('/');
+    return data.ingredients.every(validId) && data.recipes.every(validId);
   },
 
   async importData(data) {
@@ -288,6 +329,7 @@ export const Store = {
     } else {
       this.state = next;
       this._persistLocal();
+      this._cb.onChange();
     }
   },
 
@@ -324,6 +366,8 @@ export const Store = {
         if (op.type === 'del') batch.delete(op.ref);
         else batch.set(op.ref, op.data);
       }
+      // Offline this resolves only once synced; import is an explicit,
+      // user-initiated action, so waiting (with a spinner) is acceptable.
       await batch.commit();
     }
   },
@@ -346,8 +390,8 @@ export const Store = {
     localStorage.removeItem(LS_KEY);
   },
 
+  // Only called on an explicit "don't move" — never on a dismissed dialog.
   dismissLocalData() {
-    // User chose not to migrate; keep the backup under a parking key just in case.
     const raw = localStorage.getItem(LS_KEY);
     if (raw) localStorage.setItem(LS_KEY + '-archived', raw);
     localStorage.removeItem(LS_KEY);

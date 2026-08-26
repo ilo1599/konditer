@@ -553,8 +553,10 @@ img, svg { display: block; }
   justify-content: space-between;
   gap: var(--s-base);
   margin-bottom: var(--s-base);
+  flex-wrap: wrap;
 }
 .section-title-row .section-title { margin-bottom: 0; }
+.section-actions { display: flex; gap: var(--s-sm); flex-wrap: wrap; }
 
 /* recipe item rows */
 .item-row {
@@ -629,6 +631,10 @@ img, svg { display: block; }
   font-weight: 700;
   line-height: 1.43;
   margin-bottom: var(--s-base);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--s-sm);
 }
 
 .summary-size-tabs {
@@ -692,7 +698,7 @@ img, svg { display: block; }
 .summary-price .lbl { font-size: 14px; font-weight: 500; }
 .summary-price .val { font-size: 24px; font-weight: 700; color: var(--primary); white-space: nowrap; }
 
-.summary-note { font-size: 13px; color: var(--muted-soft); margin-top: var(--s-md); line-height: 1.4; }
+.summary-note { font-size: 13px; color: var(--muted); margin-top: var(--s-md); line-height: 1.4; }
 
 .save-indicator {
   display: inline-flex;
@@ -913,7 +919,13 @@ img, svg { display: block; }
 
 @media (max-width: 900px) {
   .detail-layout { grid-template-columns: 1fr; }
-  .summary-card { position: static; }
+  /* On narrow screens the summary leads instead of trailing the whole editor,
+     so the cost is visible without scrolling past every row. */
+  .detail-layout .summary-card {
+    position: static;
+    order: -1;
+    margin-bottom: var(--s-lg);
+  }
 }
 
 @media (max-width: 744px) {
@@ -925,13 +937,45 @@ img, svg { display: block; }
   .mode-badge { display: none; }
   #main { padding: var(--s-lg) var(--s-base) var(--s-xxl); }
   .page-title { font-size: 24px; }
-  .card-grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: var(--s-base) var(--s-md); }
+  .card-grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: var(--s-base) var(--s-md); }
   .cake-card-emoji { font-size: 56px; }
-  .item-row { grid-template-columns: minmax(0, 1fr) 84px 80px auto 28px; }
+
+  /* Two-line rows: the ingredient picker gets the full width, the numbers
+     sit beneath it. A 5-column grid is unusable at phone widths. */
+  .item-row {
+    grid-template-columns: 1fr 88px auto 32px;
+    grid-template-areas:
+      'ing ing ing ing'
+      'qty unit cost del';
+    row-gap: var(--s-sm);
+    padding: var(--s-md) 0;
+    border-bottom: 1px solid var(--hairline-soft);
+  }
+  .item-row .item-ing { grid-area: ing; }
+  .item-row .item-qty { grid-area: qty; }
+  .item-row .item-unit { grid-area: unit; }
+  .item-row .item-cost { grid-area: cost; min-width: 0; }
+  .item-row .item-del { grid-area: del; justify-self: end; }
+
+  .size-row {
+    grid-template-columns: 1fr 104px 32px;
+    grid-template-areas:
+      'label label del'
+      'mult weight weight';
+    row-gap: var(--s-sm);
+    padding: var(--s-md) 0;
+    border-bottom: 1px solid var(--hairline-soft);
+  }
+  .size-row > input[data-size-field='label'] { grid-area: label; }
+  .size-row .size-x { grid-area: mult; }
+  .size-row .size-weight { grid-area: weight; text-align: left; align-self: center; }
+  .size-row > button { grid-area: del; justify-self: end; }
+
   .ing-row { grid-template-columns: 1fr auto auto; padding: var(--s-md) var(--s-base); }
   .ing-row .ing-unitcost { display: none; }
   .editor-head { flex-direction: row; }
   .name-input { font-size: 19px; }
   .summary-card { padding: var(--s-base); }
-  .modal-actions { flex-direction: column; }
+  .modal-actions { flex-direction: column-reverse; }
+  .modal-actions .btn { width: 100%; }
 }

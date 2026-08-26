@@ -2,12 +2,15 @@
 // app.js — views, routing, events.
 // Vanilla JS, no build step. State lives in Store; the recipe
 // editor works on a draft that auto-saves with a debounce.
+//
+// Store writes are synchronous and optimistic: local state and the
+// UI update immediately, the cloud catches up in the background.
 // ============================================================
 
 import { t, tp, getLang, setLang } from './i18n.js';
 import {
-  UNITS, compatibleUnits, unitPrice, itemCost, recipeCosts,
-  multiplierFromDiameter, multiplierFromWeight, parseNum,
+  UNITS, compatibleUnits, unitPrice, itemCost, recipeCosts, hasUnweighedPieces,
+  multiplierFromDiameter, multiplierFromWeight, parseNum, roundCents,
   fmtMoney, fmtNum, fmtWeight,
 } from './calc.js';
 import { Store } from './store.js';
@@ -36,14 +39,24 @@ function uid() {
     : 'id-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
 }
 
+// structuredClone arrived in the same browser generation as crypto.randomUUID;
+// draft objects are plain JSON, so the JSON round-trip is an exact fallback.
+function clone(obj) {
+  return typeof structuredClone === 'function'
+    ? structuredClone(obj)
+    : JSON.parse(JSON.stringify(obj));
+}
+
 function plateFor(id) {
   let h = 0;
   for (const ch of String(id)) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
   return PLATES[h % PLATES.length];
 }
 
+// Empty string for "not set". 0 is a real value and must stay visible,
+// otherwise an explicit 0% margin would look like "use the default".
 function numToInput(n) {
-  if (n === null || n === undefined || n === '' || n === 0) return '';
+  if (n === null || n === undefined || n === '') return '';
   const s = String(n);
   return getLang() === 'ru' ? s.replace('.', ',') : s;
 }
@@ -97,41 +110,78 @@ function showToast(msg) {
   setTimeout(() => {
     el.classList.add('leaving');
     setTimeout(() => el.remove(), 350);
-  }, 2200);
+  }, 2600);
 }
 
 // ---------------- modal ----------------
 
 let activeModal = null;
+const FOCUSABLE =
+  'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])';
 
 function openModal({ title, body }) {
   closeModal(null);
   const root = document.getElementById('modal-root');
+  const previousFocus = document.activeElement;
+  const titleId = 'modal-title-' + uid().slice(0, 8);
+
   const scrim = document.createElement('div');
   scrim.className = 'modal-scrim';
   scrim.innerHTML = `
-    <div class="modal" role="dialog" aria-modal="true">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="${titleId}" tabindex="-1">
       <div class="modal-head">
         <button class="modal-close" data-modal-close aria-label="${esc(t('close'))}">
           <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 2l12 12M14 2L2 14"/></svg>
         </button>
-        <div class="modal-title">${esc(title)}</div>
+        <div class="modal-title" id="${titleId}">${esc(title)}</div>
         <span style="width:32px"></span>
       </div>
       <div class="modal-body">${body}</div>
     </div>`;
   root.appendChild(scrim);
 
+  const dialog = scrim.querySelector('.modal');
+
   let resolver;
   const promise = new Promise((res) => (resolver = res));
   const close = (value) => {
     if (activeModal?.scrim === scrim) activeModal = null;
     scrim.remove();
+    // Return focus where the user left it.
+    if (previousFocus && document.contains(previousFocus)) {
+      try { previousFocus.focus(); } catch { /* element may be gone */ }
+    }
     resolver(value);
   };
+
   scrim.addEventListener('click', (e) => {
     if (e.target === scrim || e.target.closest('[data-modal-close]')) close(null);
   });
+
+  // Keep Tab inside the dialog while it is open.
+  scrim.addEventListener('keydown', (e) => {
+    if (e.key !== 'Tab') return;
+    const items = [...dialog.querySelectorAll(FOCUSABLE)].filter((el) => el.offsetParent !== null);
+    if (items.length === 0) {
+      e.preventDefault();
+      dialog.focus();
+      return;
+    }
+    const first = items[0];
+    const last = items[items.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  });
+
+  // Focus the first useful control (an input if there is one, else the dialog).
+  const firstField = dialog.querySelector('input, select, textarea');
+  (firstField || dialog).focus();
+
   activeModal = { scrim, close, promise };
   return activeModal;
 }
@@ -144,14 +194,15 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') closeModal(null);
 });
 
-function confirmModal({ title, text, confirmLabel, danger = false }) {
+// Returns true (confirm), or null/false for every dismissal path.
+function confirmModal({ title, text, confirmLabel }) {
   const m = openModal({
     title,
     body: `
       <p>${esc(text)}</p>
       <div class="modal-actions" style="padding:24px 0 0">
         <button class="btn btn-secondary" data-modal-close>${esc(t('cancel'))}</button>
-        <button class="btn ${danger ? 'btn-primary' : 'btn-primary'}" data-confirm>${esc(confirmLabel)}</button>
+        <button class="btn btn-primary" data-confirm>${esc(confirmLabel)}</button>
       </div>`,
   });
   m.scrim.querySelector('[data-confirm]').addEventListener('click', () => m.close(true));
@@ -181,28 +232,53 @@ let selectedSizeId = null; // size chip selection in the summary
 let saveTimer = null;
 let focusNameOnRender = false;
 
+// Older recipes stored items without ids; give them stable ones so rows can be
+// addressed by identity rather than by array index.
+function normalizeDraft(rec) {
+  const d = clone(rec);
+  d.items = (d.items || []).map((it) => (it.id ? it : { ...it, id: uid() }));
+  d.sizes = (d.sizes || []).map((s) => (s.id ? s : { ...s, id: uid() }));
+  if (d.sizes.length === 0) d.sizes.push({ id: uid(), label: t('baseSizeLabel'), multiplier: 1 });
+  return d;
+}
+
 function ensureDraft(id) {
   if (draft && draft.id === id) return draft;
   const rec = Store.state.recipes.find((r) => r.id === id);
-  draft = rec ? structuredClone(rec) : null;
+  draft = rec ? normalizeDraft(rec) : null;
   selectedSizeId = draft?.sizes?.[0]?.id ?? null;
   return draft;
 }
 
+function draftItem(id) {
+  return draft?.items?.find((i) => i.id === id) || null;
+}
+
+function draftSize(id) {
+  return draft?.sizes?.find((s) => s.id === id) || null;
+}
+
 function scheduleSave() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(async () => {
-    if (!draft) return;
-    await Store.saveRecipe(structuredClone(draft));
-    flashSaved();
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    commitDraft();
   }, 600);
 }
 
-async function saveNow() {
-  clearTimeout(saveTimer);
+function commitDraft() {
   if (!draft) return;
-  await Store.saveRecipe(structuredClone(draft));
+  Store.saveRecipe(clone(draft));
   flashSaved();
+}
+
+// Write any pending debounced edit immediately — called before leaving the editor.
+function flushDraft() {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+    commitDraft();
+  }
 }
 
 function flashSaved() {
@@ -220,6 +296,9 @@ function applyStaticI18n() {
   document.title = `${t('appName')} — ${t('tagline')}`;
   document.querySelectorAll('[data-i18n]').forEach((el) => {
     el.textContent = t(el.dataset.i18n);
+  });
+  document.querySelectorAll('[data-i18n-aria]').forEach((el) => {
+    el.setAttribute('aria-label', t(el.dataset.i18nAria));
   });
 }
 
@@ -242,9 +321,15 @@ function updateActiveTab(routeName) {
 function render() {
   const route = parseRoute();
 
+  if (Store.fatalError) {
+    topnav.hidden = true;
+    main.innerHTML = viewFatal(Store.fatalError);
+    return;
+  }
+
   if (!Store.ready) {
     topnav.hidden = true;
-    main.innerHTML = `<div class="boot-loading"><div class="spinner"></div></div>`;
+    main.innerHTML = `<div class="boot-loading"><div class="spinner" aria-label="${esc(t('ariaLoading'))}"></div></div>`;
     return;
   }
 
@@ -260,9 +345,9 @@ function render() {
   updateModeBadge();
   updateActiveTab(route.name);
 
-  if (route.name !== 'cake') {
+  if (route.name !== 'cake' && draft) {
+    flushDraft();
     draft = null;
-    clearTimeout(saveTimer);
   }
 
   if (route.name === 'cakes') main.innerHTML = viewCakes();
@@ -283,6 +368,15 @@ function render() {
     }
   } else if (route.name === 'ingredients') main.innerHTML = viewIngredients();
   else if (route.name === 'settings') main.innerHTML = viewSettings();
+}
+
+function viewFatal(kind) {
+  return `
+    <div class="empty">
+      <div class="empty-emoji">📡</div>
+      <div class="empty-title">${esc(t(kind === 'cdn' ? 'cdnError' : 'loadError'))}</div>
+      <button class="btn btn-primary" data-action="reload-page">${esc(t('reload'))}</button>
+    </div>`;
 }
 
 // ----- cakes list -----
@@ -344,7 +438,18 @@ function viewCakes() {
 
 // ----- cake editor -----
 
-function itemRowHtml(item, index, byId) {
+function warnKey(w) {
+  return { missing: 'warnMissing', mismatch: 'warnMismatch', price: 'warnPrice' }[w] || 'warnMismatch';
+}
+
+function itemCostHtml(item, byId) {
+  const r = itemCost(item, byId);
+  return r.warning
+    ? `<span class="item-warn">${esc(t(warnKey(r.warning)))}</span>`
+    : `<span>${esc(fmtMoney(roundCents(r.cost), getLang()))}</span>`;
+}
+
+function itemRowHtml(item, byId) {
   const ing = byId[item.ingredientId];
   const options = sortedIngredients()
     .map(
@@ -361,50 +466,40 @@ function itemRowHtml(item, index, byId) {
     .map((u) => `<option value="${esc(u)}" ${u === item.unit ? 'selected' : ''}>${esc(unitLabel(u))}</option>`)
     .join('');
 
-  const r = itemCost(item, byId);
-  const costHtml = r.warning
-    ? `<span class="item-warn">${esc(t(warnKey(r.warning)))}</span>`
-    : `<span>${esc(fmtMoney(r.cost, getLang()))}</span>`;
-
   return `
-    <div class="item-row" data-index="${index}">
-      <select class="select compact" data-item-field="ingredientId" data-index="${index}" aria-label="${esc(
-        t('chooseIngredient')
-      )}">
+    <div class="item-row" data-item-id="${esc(item.id)}">
+      <select class="select compact item-ing" data-item-field="ingredientId" data-item-id="${esc(item.id)}"
+        aria-label="${esc(t('chooseIngredient'))}">
         ${placeholder}${options}
       </select>
-      <input class="input compact" data-item-field="qty" data-index="${index}" inputmode="decimal"
+      <input class="input compact item-qty" data-item-field="qty" data-item-id="${esc(item.id)}" inputmode="decimal"
         placeholder="${esc(t('qty'))}" value="${esc(numToInput(item.qty))}" aria-label="${esc(t('qty'))}">
-      <select class="select compact" data-item-field="unit" data-index="${index}" aria-label="${esc(t('unit'))}">
+      <select class="select compact item-unit" data-item-field="unit" data-item-id="${esc(item.id)}"
+        aria-label="${esc(t('unit'))}">
         ${unitOptions}
       </select>
-      <div class="item-cost" id="item-cost-${index}">${costHtml}</div>
-      <button class="icon-btn subtle" data-action="remove-item" data-index="${index}" aria-label="${esc(t('delete'))}">
+      <div class="item-cost" data-cost-for="${esc(item.id)}">${itemCostHtml(item, byId)}</div>
+      <button class="icon-btn subtle item-del" data-action="remove-item" data-item-id="${esc(item.id)}"
+        aria-label="${esc(t('delete'))}">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2.5 4.5h11M6.5 2.5h3M5.5 4.5V13a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1V4.5M7 7v4.5M9 7v4.5"/></svg>
       </button>
     </div>`;
 }
 
-function warnKey(w) {
-  return { missing: 'warnMissing', mismatch: 'warnMismatch', price: 'warnPrice' }[w] || 'warnMismatch';
-}
-
-function sizeRowHtml(size, index, costs) {
+function sizeRowHtml(size, costs) {
   const sz = costs.sizes.find((s) => s.id === size.id);
   const weight = sz && sz.weight > 0 ? fmtWeight(sz.weight, getLang()) : '';
   return `
-    <div class="size-row" data-index="${index}">
-      <input class="input compact" data-size-field="label" data-index="${index}"
+    <div class="size-row" data-size-id="${esc(size.id)}">
+      <input class="input compact" data-size-field="label" data-size-id="${esc(size.id)}"
         placeholder="${esc(t('sizeNamePlaceholder'))}" value="${esc(size.label)}" aria-label="${esc(t('sizes'))}">
       <div class="size-x">
         <span class="x-sign">×</span>
-        <input class="input compact" data-size-field="multiplier" data-index="${index}" inputmode="decimal"
-          value="${esc(numToInput(size.multiplier))}" aria-label="${esc(t('multiplierHint'))}" title="${esc(
-            t('multiplierHint')
-          )}">
+        <input class="input compact" data-size-field="multiplier" data-size-id="${esc(size.id)}" inputmode="decimal"
+          value="${esc(numToInput(size.multiplier))}" aria-label="${esc(t('multiplierHint'))}">
       </div>
-      <div class="size-weight" id="size-weight-${index}">${esc(weight)}</div>
-      <button class="icon-btn subtle" data-action="remove-size" data-index="${index}" aria-label="${esc(t('delete'))}">
+      <div class="size-weight" data-weight-for="${esc(size.id)}">${esc(weight)}</div>
+      <button class="icon-btn subtle" data-action="remove-size" data-size-id="${esc(size.id)}" aria-label="${esc(t('delete'))}">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2.5 4.5h11M6.5 2.5h3M5.5 4.5V13a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1V4.5M7 7v4.5M9 7v4.5"/></svg>
       </button>
     </div>`;
@@ -427,27 +522,23 @@ function summaryHtml(d) {
     .join('');
 
   const lang = getLang();
-  const laborMin = Number(d.laborMinutes) || 0;
-  const laborCost = (laborMin / 60) * (Number(Store.state.settings.laborRate) || 0);
-  const packCost = Number(d.packagingCost) || 0;
-
   const rows = [];
   rows.push(
     `<div class="summary-row"><span class="lbl">${esc(t('rowIngredients'))}</span><span class="val">${esc(
       fmtMoney(sel.rawCost, lang)
     )}</span></div>`
   );
-  if (packCost > 0)
+  if (sel.packagingCost > 0)
     rows.push(
       `<div class="summary-row"><span class="lbl">${esc(t('rowPackaging'))}</span><span class="val">${esc(
-        fmtMoney(packCost, lang)
+        fmtMoney(sel.packagingCost, lang)
       )}</span></div>`
     );
-  if (laborCost > 0)
+  if (sel.laborCost > 0)
     rows.push(
-      `<div class="summary-row"><span class="lbl">${esc(t('rowLabor', { n: laborMin }))}</span><span class="val">${esc(
-        fmtMoney(laborCost, lang)
-      )}</span></div>`
+      `<div class="summary-row"><span class="lbl">${esc(
+        t('rowLabor', { n: fmtNum(sel.laborMinutes, lang) })
+      )}</span><span class="val">${esc(fmtMoney(sel.laborCost, lang))}</span></div>`
     );
   if (sel.weight > 0) {
     rows.push(
@@ -458,18 +549,19 @@ function summaryHtml(d) {
     if (sel.fullCost > 0)
       rows.push(
         `<div class="summary-row"><span class="lbl">${esc(t('rowCostPerKg'))}</span><span class="val">${esc(
-          fmtMoney(sel.fullCost / (sel.weight / 1000), lang)
+          fmtMoney(roundCents(sel.fullCost / (sel.weight / 1000)), lang)
         )}</span></div>`
       );
   }
 
-  const note =
-    costs.marginPct > 0
-      ? t('summaryNote', { n: fmtNum(costs.marginPct, lang) })
-      : t('summaryNoMargin');
+  const notes = [];
+  notes.push(
+    costs.marginPct > 0 ? t('summaryNote', { n: fmtNum(costs.marginPct, lang) }) : t('summaryNoMargin')
+  );
+  if (hasUnweighedPieces(d, byId)) notes.push(t('weightApprox'));
 
   return `
-    <div class="summary-title" style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+    <div class="summary-title">
       <span>${esc(t('costTitle'))}</span>
       <span class="save-indicator" id="save-indicator">✓ ${esc(t('saved'))}</span>
     </div>
@@ -484,7 +576,7 @@ function summaryHtml(d) {
       <span class="lbl">${esc(t('rowPrice'))}</span>
       <span class="val">${esc(fmtMoney(sel.price, lang))}</span>
     </div>
-    <div class="summary-note">${esc(note)}</div>`;
+    ${notes.map((n) => `<div class="summary-note">${esc(n)}</div>`).join('')}`;
 }
 
 function viewCakeDetail(d) {
@@ -492,8 +584,8 @@ function viewCakeDetail(d) {
   const costs = recipeCosts(d, byId, Store.state.settings);
   const hasIngredients = Store.state.ingredients.length > 0;
 
-  const itemsHtml = (d.items || []).map((item, i) => itemRowHtml(item, i, byId)).join('');
-  const sizesHtml = (d.sizes || []).map((s, i) => sizeRowHtml(s, i, costs)).join('');
+  const itemsHtml = (d.items || []).map((item) => itemRowHtml(item, byId)).join('');
+  const sizesHtml = (d.sizes || []).map((s) => sizeRowHtml(s, costs)).join('');
 
   const compositionBody = hasIngredients
     ? `${itemsHtml}
@@ -518,11 +610,12 @@ function viewCakeDetail(d) {
     <div class="detail-layout">
       <div class="editor">
         <div class="editor-head">
-          <button class="emoji-btn" data-action="pick-emoji" title="${esc(t('emojiPickerTitle'))}">${esc(
+          <button class="emoji-btn" data-action="pick-emoji" aria-label="${esc(t('emojiPickerTitle'))}">${esc(
             d.emoji || '🎂'
           )}</button>
           <input class="name-input" id="cake-name" data-recipe-field="name"
-            placeholder="${esc(t('cakeNamePlaceholder'))}" value="${esc(d.name)}">
+            placeholder="${esc(t('cakeNamePlaceholder'))}" value="${esc(d.name)}"
+            aria-label="${esc(t('cakeNamePlaceholder'))}">
         </div>
 
         <div class="section">
@@ -533,11 +626,12 @@ function viewCakeDetail(d) {
         <div class="section">
           <div class="section-title-row">
             <div class="section-title">${esc(t('sizes'))}</div>
-            <div style="display:flex;gap:8px">
+            <div class="section-actions">
               <button class="btn btn-secondary btn-sm" data-action="size-by-diameter">${esc(t('byDiameter'))}</button>
               <button class="btn btn-secondary btn-sm" data-action="size-by-weight">${esc(t('byWeight'))}</button>
             </div>
           </div>
+          <div class="settings-hint" style="margin-bottom:12px">${esc(t('multiplierHint'))}</div>
           ${sizesHtml}
           <button class="add-row-btn" data-action="add-size"><span class="plus">+</span>${esc(t('addSize'))}</button>
         </div>
@@ -546,20 +640,20 @@ function viewCakeDetail(d) {
           <div class="section-title">${esc(t('extras'))}</div>
           <div class="form-grid">
             <div class="field">
-              <label class="field-label">${esc(t('packagingCost'))}</label>
-              <input class="input compact" data-recipe-field="packagingCost" inputmode="decimal"
+              <label class="field-label" for="rec-packaging">${esc(t('packagingCost'))}</label>
+              <input class="input compact" id="rec-packaging" data-recipe-field="packagingCost" inputmode="decimal"
                 value="${esc(numToInput(d.packagingCost))}">
             </div>
             <div class="field">
-              <label class="field-label">${esc(t('laborMinutes'))}</label>
-              <input class="input compact" data-recipe-field="laborMinutes" inputmode="numeric"
+              <label class="field-label" for="rec-labor">${esc(t('laborMinutes'))}</label>
+              <input class="input compact" id="rec-labor" data-recipe-field="laborMinutes" inputmode="numeric"
                 value="${esc(numToInput(d.laborMinutes))}">
             </div>
             <div class="field">
-              <label class="field-label">${esc(t('marginPct'))}</label>
-              <input class="input compact" data-recipe-field="marginPct" inputmode="decimal"
+              <label class="field-label" for="rec-margin">${esc(t('marginPct'))}</label>
+              <input class="input compact" id="rec-margin" data-recipe-field="marginPct" inputmode="decimal"
                 placeholder="${esc(marginPlaceholder)}"
-                value="${esc(d.marginPct === null || d.marginPct === undefined ? '' : numToInput(d.marginPct))}">
+                value="${esc(numToInput(d.marginPct))}">
             </div>
           </div>
           <div class="settings-hint">${esc(t('extrasHint'))}</div>
@@ -574,22 +668,19 @@ function viewCakeDetail(d) {
     </div>`;
 }
 
+// Recompute only the derived cells, leaving inputs (and focus) untouched.
 function updateComputed() {
   if (!draft) return;
   const byId = ingredientsById();
   const costs = recipeCosts(draft, byId, Store.state.settings);
 
-  (draft.items || []).forEach((item, i) => {
-    const cell = document.getElementById(`item-cost-${i}`);
-    if (!cell) return;
-    const r = itemCost(item, byId);
-    cell.innerHTML = r.warning
-      ? `<span class="item-warn">${esc(t(warnKey(r.warning)))}</span>`
-      : `<span>${esc(fmtMoney(r.cost, getLang()))}</span>`;
+  (draft.items || []).forEach((item) => {
+    const cell = main.querySelector(`[data-cost-for="${CSS.escape(item.id)}"]`);
+    if (cell) cell.innerHTML = itemCostHtml(item, byId);
   });
 
-  (draft.sizes || []).forEach((s, i) => {
-    const cell = document.getElementById(`size-weight-${i}`);
+  (draft.sizes || []).forEach((s) => {
+    const cell = main.querySelector(`[data-weight-for="${CSS.escape(s.id)}"]`);
     if (!cell) return;
     const sz = costs.sizes.find((x) => x.id === s.id);
     cell.textContent = sz && sz.weight > 0 ? fmtWeight(sz.weight, getLang()) : '';
@@ -619,7 +710,7 @@ function viewIngredients() {
     .map((i) => {
       const up = unitPriceDisplay(i);
       const upHtml = up
-        ? `<b>${esc(fmtMoney(up.value, lang))}</b> <span>${esc(t('perUnit', { unit: up.unit }))}</span>`
+        ? `<b>${esc(fmtMoney(roundCents(up.value), lang))}</b> <span>${esc(t('perUnit', { unit: up.unit }))}</span>`
         : `<span class="item-warn">${esc(t('warnPrice'))}</span>`;
       return `
         <div class="ing-row">
@@ -649,7 +740,7 @@ function viewIngredients() {
 }
 
 function ingredientModal(existing) {
-  const ing = existing || { id: uid(), name: '', packQty: '', packUnit: 'kg', packPrice: '' };
+  const ing = existing || { id: uid(), name: '', packQty: '', packUnit: 'kg', packPrice: '', gramsPerPiece: '' };
   const unitOptions = ['g', 'kg', 'ml', 'l', 'pcs']
     .map((u) => `<option value="${u}" ${u === ing.packUnit ? 'selected' : ''}>${esc(unitLabel(u))}</option>`)
     .join('');
@@ -658,22 +749,27 @@ function ingredientModal(existing) {
     title: existing ? t('editIngredient') : t('newIngredient'),
     body: `
       <div class="field" style="margin-bottom:16px">
-        <label class="field-label">${esc(t('ingName'))}</label>
+        <label class="field-label" for="ing-name">${esc(t('ingName'))}</label>
         <input class="input" id="ing-name" placeholder="${esc(t('ingNamePlaceholder'))}" value="${esc(ing.name)}">
       </div>
       <div class="form-grid" style="grid-template-columns:1fr 100px 1fr">
         <div class="field">
-          <label class="field-label">${esc(t('packQty'))}</label>
+          <label class="field-label" for="ing-qty">${esc(t('packQty'))}</label>
           <input class="input" id="ing-qty" inputmode="decimal" value="${esc(numToInput(ing.packQty))}">
         </div>
         <div class="field">
-          <label class="field-label">${esc(t('packUnit'))}</label>
+          <label class="field-label" for="ing-unit">${esc(t('packUnit'))}</label>
           <select class="select" id="ing-unit">${unitOptions}</select>
         </div>
         <div class="field">
-          <label class="field-label">${esc(t('packPrice'))}</label>
+          <label class="field-label" for="ing-price">${esc(t('packPrice'))}</label>
           <input class="input" id="ing-price" inputmode="decimal" value="${esc(numToInput(ing.packPrice))}">
         </div>
+      </div>
+      <div class="field" id="gpp-field" style="margin-top:16px" ${ing.packUnit === 'pcs' ? '' : 'hidden'}>
+        <label class="field-label" for="ing-gpp">${esc(t('gramsPerPiece'))}</label>
+        <input class="input" id="ing-gpp" inputmode="decimal" value="${esc(numToInput(ing.gramsPerPiece))}">
+        <div class="settings-hint">${esc(t('gramsPerPieceHint'))}</div>
       </div>
       <div class="field-error" id="ing-error" style="margin-top:12px"></div>
       <div class="modal-actions" style="padding:24px 0 0">
@@ -683,21 +779,30 @@ function ingredientModal(existing) {
   });
 
   const $ = (id) => m.scrim.querySelector('#' + id);
+
+  // The per-piece weight only makes sense for piece-counted ingredients.
+  $('ing-unit').addEventListener('change', () => {
+    $('gpp-field').hidden = $('ing-unit').value !== 'pcs';
+  });
+
   $('ing-save').addEventListener('click', () => {
     const name = $('ing-name').value.trim();
     const qty = parseNum($('ing-qty').value);
     const price = parseNum($('ing-price').value);
     const unit = $('ing-unit').value;
+    const gpp = parseNum($('ing-gpp').value);
     if (!name || qty === null || qty <= 0 || price === null || price < 0) {
-      $('ing-error').textContent = t('errGeneric');
+      $('ing-error').textContent = t('ingFormError');
       if (!name) $('ing-name').focus();
       else if (qty === null || qty <= 0) $('ing-qty').focus();
       else $('ing-price').focus();
       return;
     }
-    m.close({ id: ing.id, name, packQty: qty, packUnit: unit, packPrice: price });
+    const out = { id: ing.id, name, packQty: qty, packUnit: unit, packPrice: price };
+    // Firestore rejects undefined; store null when there is no value.
+    out.gramsPerPiece = unit === 'pcs' && gpp !== null && gpp > 0 ? gpp : null;
+    m.close(out);
   });
-  setTimeout(() => $('ing-name').focus(), 50);
   return m.promise;
 }
 
@@ -740,8 +845,8 @@ function viewSettings() {
       <div class="settings-block-title">${esc(t('calcBlock'))}</div>
       <div class="settings-row">
         <div class="field">
-          <label class="field-label">${esc(t('laborRateLabel'))}</label>
-          <input class="input compact" data-setting="laborRate" inputmode="decimal" value="${esc(
+          <label class="field-label" for="set-labor">${esc(t('laborRateLabel'))}</label>
+          <input class="input compact" id="set-labor" data-setting="laborRate" inputmode="decimal" value="${esc(
             numToInput(s.laborRate)
           )}">
         </div>
@@ -749,8 +854,8 @@ function viewSettings() {
       <div class="settings-hint">${esc(t('laborRateHint'))}</div>
       <div class="settings-row" style="margin-top:8px">
         <div class="field">
-          <label class="field-label">${esc(t('defaultMarginLabel'))}</label>
-          <input class="input compact" data-setting="marginPct" inputmode="decimal" value="${esc(
+          <label class="field-label" for="set-margin">${esc(t('defaultMarginLabel'))}</label>
+          <input class="input compact" id="set-margin" data-setting="marginPct" inputmode="decimal" value="${esc(
             numToInput(s.marginPct)
           )}">
         </div>
@@ -874,31 +979,34 @@ function sizeHelperDiameter() {
     body: `
       <div class="form-grid" style="grid-template-columns:1fr 1fr">
         <div class="field">
-          <label class="field-label">${esc(t('diameterBase'))}</label>
+          <label class="field-label" for="dia-base">${esc(t('diameterBase'))}</label>
           <input class="input" id="dia-base" inputmode="decimal">
         </div>
         <div class="field">
-          <label class="field-label">${esc(t('diameterNew'))}</label>
+          <label class="field-label" for="dia-new">${esc(t('diameterNew'))}</label>
           <input class="input" id="dia-new" inputmode="decimal">
         </div>
       </div>
       <p style="margin-top:12px">${esc(t('diameterNote'))}</p>
+      <div class="field-error" id="dia-error" style="margin-top:12px"></div>
       <div class="modal-actions" style="padding:24px 0 0">
         <button class="btn btn-secondary" data-modal-close>${esc(t('cancel'))}</button>
         <button class="btn btn-primary" id="dia-apply">${esc(t('apply'))}</button>
       </div>`,
   });
   m.scrim.querySelector('#dia-apply').addEventListener('click', () => {
-    const k = multiplierFromDiameter(
-      parseNum(m.scrim.querySelector('#dia-base').value),
-      parseNum(m.scrim.querySelector('#dia-new').value)
-    );
-    if (k === null) return;
     const base = parseNum(m.scrim.querySelector('#dia-base').value);
     const next = parseNum(m.scrim.querySelector('#dia-new').value);
-    m.close({ multiplier: Math.round(k * 100) / 100, label: `${fmtNum(next, getLang())} ${getLang() === 'ru' ? 'см' : 'cm'}` });
+    const k = multiplierFromDiameter(base, next);
+    if (k === null) {
+      m.scrim.querySelector('#dia-error').textContent = t('ingFormError');
+      return;
+    }
+    m.close({
+      multiplier: Math.round(k * 100) / 100,
+      label: `${fmtNum(next, getLang())} ${getLang() === 'ru' ? 'см' : 'cm'}`,
+    });
   });
-  setTimeout(() => m.scrim.querySelector('#dia-base').focus(), 50);
   return m.promise;
 }
 
@@ -914,10 +1022,11 @@ function sizeHelperWeight(baseWeightG) {
         <span class="val"><b>${esc(fmtWeight(baseWeightG, lang))}</b></span>
       </div>
       <div class="field">
-        <label class="field-label">${esc(t('weightTarget'))}</label>
+        <label class="field-label" for="wt-target">${esc(t('weightTarget'))}</label>
         <input class="input" id="wt-target" inputmode="decimal">
       </div>
       <p style="margin-top:12px">${esc(t('weightNote'))}</p>
+      <div class="field-error" id="wt-error" style="margin-top:12px"></div>
       <div class="modal-actions" style="padding:24px 0 0">
         <button class="btn btn-secondary" data-modal-close>${esc(t('cancel'))}</button>
         <button class="btn btn-primary" id="wt-apply">${esc(t('apply'))}</button>
@@ -931,14 +1040,16 @@ function sizeHelperWeight(baseWeightG) {
     m.scrim.querySelector('#wt-apply').addEventListener('click', () => {
       const target = parseNum(m.scrim.querySelector('#wt-target').value);
       const k = multiplierFromWeight(baseWeightG, target);
-      if (k === null) return;
+      if (k === null) {
+        m.scrim.querySelector('#wt-error').textContent = t('ingFormError');
+        return;
+      }
       const label =
         target >= 1000
           ? `${fmtNum(target / 1000, lang)} ${lang === 'ru' ? 'кг' : 'kg'}`
           : `${fmtNum(target, lang)} ${lang === 'ru' ? 'г' : 'g'}`;
       m.close({ multiplier: Math.round(k * 100) / 100, label });
     });
-    setTimeout(() => m.scrim.querySelector('#wt-target').focus(), 50);
   }
   return m.promise;
 }
@@ -960,18 +1071,20 @@ function emojiModal(current) {
 
 // ---------------- sample data ----------------
 
-async function addSampleData() {
+function addSampleData() {
   const ru = getLang() === 'ru';
-  const mk = (name, packQty, packUnit, packPrice) => ({ id: uid(), name, packQty, packUnit, packPrice });
+  const mk = (name, packQty, packUnit, packPrice, gramsPerPiece = null) => ({
+    id: uid(), name, packQty, packUnit, packPrice, gramsPerPiece,
+  });
   const flour = mk(ru ? 'Мука пшеничная' : 'Wheat flour', 1, 'kg', 1.2);
   const butter = mk(ru ? 'Масло сливочное' : 'Butter', 0.5, 'kg', 4.5);
   const milk = mk(ru ? 'Молоко' : 'Milk', 1, 'l', 1.1);
   const sugar = mk(ru ? 'Сахар' : 'Sugar', 1, 'kg', 1.3);
-  const eggs = mk(ru ? 'Яйца' : 'Eggs', 10, 'pcs', 2.8);
+  const eggs = mk(ru ? 'Яйца' : 'Eggs', 10, 'pcs', 2.8, 55);
   const condensed = mk(ru ? 'Сгущённое молоко' : 'Condensed milk', 400, 'g', 2.2);
 
   for (const ing of [flour, butter, milk, sugar, eggs, condensed]) {
-    await Store.saveIngredient(ing);
+    Store.saveIngredient(ing);
   }
 
   const recipe = {
@@ -979,12 +1092,12 @@ async function addSampleData() {
     name: ru ? 'Наполеон' : 'Napoleon',
     emoji: '🍰',
     items: [
-      { ingredientId: flour.id, qty: 600, unit: 'g' },
-      { ingredientId: butter.id, qty: 400, unit: 'g' },
-      { ingredientId: milk.id, qty: 500, unit: 'ml' },
-      { ingredientId: sugar.id, qty: 150, unit: 'g' },
-      { ingredientId: eggs.id, qty: 3, unit: 'pcs' },
-      { ingredientId: condensed.id, qty: 200, unit: 'g' },
+      { id: uid(), ingredientId: flour.id, qty: 600, unit: 'g' },
+      { id: uid(), ingredientId: butter.id, qty: 400, unit: 'g' },
+      { id: uid(), ingredientId: milk.id, qty: 500, unit: 'ml' },
+      { id: uid(), ingredientId: sugar.id, qty: 150, unit: 'g' },
+      { id: uid(), ingredientId: eggs.id, qty: 3, unit: 'pcs' },
+      { id: uid(), ingredientId: condensed.id, qty: 200, unit: 'g' },
     ],
     sizes: [
       { id: uid(), label: ru ? 'База' : 'Base', multiplier: 1 },
@@ -995,7 +1108,7 @@ async function addSampleData() {
     laborMinutes: 90,
     marginPct: null,
   };
-  await Store.saveRecipe(recipe);
+  Store.saveRecipe(recipe);
   showToast(t('sampleAdded'));
   render();
 }
@@ -1041,8 +1154,13 @@ function pickImportFile() {
       confirmLabel: t('importBtn'),
     });
     if (!ok) return;
-    await Store.importData(data);
-    showToast(t('importDone'));
+    try {
+      await Store.importData(data);
+      showToast(t('importDone'));
+    } catch (err) {
+      console.error('Import failed', err);
+      showToast(t('importError'));
+    }
     render();
   };
   input.click();
@@ -1054,28 +1172,55 @@ let migrationChecked = false;
 
 async function maybeOfferMigration() {
   if (migrationChecked) return;
-  if (Store.mode !== 'cloud' || !Store.user || !Store.ready) return;
+  if (Store.mode !== 'cloud' || !Store.user) return;
+  // Wait until every collection has reported, or an empty first snapshot
+  // would look like "the cloud is empty" and offer to overwrite real data.
+  if (!Store.isFullyLoaded()) return;
   migrationChecked = true;
   if (!Store.hasLocalData() || !Store.cloudIsEmpty()) return;
 
-  const ok = await confirmModal({
+  const m = openModal({
     title: t('migrateTitle'),
-    text: t('migrateText'),
-    confirmLabel: t('migrateYes'),
+    body: `
+      <p>${esc(t('migrateText'))}</p>
+      <div class="modal-actions" style="padding:24px 0 0">
+        <button class="btn btn-secondary" data-migrate="no">${esc(t('migrateNo'))}</button>
+        <button class="btn btn-primary" data-migrate="yes">${esc(t('migrateYes'))}</button>
+      </div>
+      <div style="text-align:center;padding-top:12px">
+        <button class="btn btn-text" data-modal-close>${esc(t('migrateLater'))}</button>
+      </div>`,
   });
-  if (ok) {
-    await Store.migrateLocalToCloud();
-    showToast(t('migrateDone'));
-  } else {
+  m.scrim.querySelector('[data-migrate="yes"]').addEventListener('click', () => m.close('yes'));
+  m.scrim.querySelector('[data-migrate="no"]').addEventListener('click', () => m.close('no'));
+
+  const choice = await m.promise;
+  if (choice === 'yes') {
+    try {
+      await Store.migrateLocalToCloud();
+      showToast(t('migrateDone'));
+    } catch (err) {
+      console.error('Migration failed', err);
+      showToast(t('saveError'));
+    }
+  } else if (choice === 'no') {
     Store.dismissLocalData();
+  } else {
+    // Dismissed — ask again next session rather than discarding the data.
+    migrationChecked = false;
   }
   render();
 }
 
 // ---------------- event wiring ----------------
 
+// Guards actions that create data against double-clicks.
+const inFlight = new Set();
+
 const actions = {
-  'new-cake': async () => {
+  'reload-page': () => location.reload(),
+
+  'new-cake': () => {
     const recipe = {
       id: uid(),
       name: '',
@@ -1086,7 +1231,7 @@ const actions = {
       laborMinutes: 0,
       marginPct: null,
     };
-    await Store.saveRecipe(recipe);
+    Store.saveRecipe(recipe);
     focusNameOnRender = true;
     navigate(`#/cakes/${recipe.id}`);
   },
@@ -1096,59 +1241,59 @@ const actions = {
   'go-ingredients': () => navigate('#/ingredients'),
   'add-sample': () => addSampleData(),
 
-  'add-item': async () => {
+  'add-item': () => {
     if (!draft) return;
     const first = sortedIngredients()[0];
     draft.items = draft.items || [];
     draft.items.push({
+      id: uid(),
       ingredientId: '',
       qty: 0,
       unit: first ? compatibleUnits(first.packUnit)[0] : 'g',
     });
-    await saveNow();
+    commitDraft();
     render();
   },
 
-  'remove-item': async (el) => {
+  'remove-item': (el) => {
     if (!draft) return;
-    draft.items.splice(Number(el.dataset.index), 1);
-    await saveNow();
+    draft.items = draft.items.filter((i) => i.id !== el.dataset.itemId);
+    commitDraft();
     render();
   },
 
-  'add-size': async () => {
+  'add-size': () => {
     if (!draft) return;
     draft.sizes = draft.sizes || [];
     draft.sizes.push({ id: uid(), label: '', multiplier: 1 });
-    await saveNow();
+    commitDraft();
     render();
   },
 
-  'remove-size': async (el) => {
+  'remove-size': (el) => {
     if (!draft) return;
-    draft.sizes.splice(Number(el.dataset.index), 1);
+    draft.sizes = draft.sizes.filter((s) => s.id !== el.dataset.sizeId);
     if (draft.sizes.length === 0) draft.sizes.push({ id: uid(), label: t('baseSizeLabel'), multiplier: 1 });
-    await saveNow();
+    commitDraft();
     render();
   },
 
   'size-by-diameter': async () => {
     if (!draft) return;
     const res = await sizeHelperDiameter();
-    if (!res) return;
+    if (!res || !draft) return;
     draft.sizes.push({ id: uid(), label: res.label, multiplier: res.multiplier });
-    await saveNow();
+    commitDraft();
     render();
   },
 
   'size-by-weight': async () => {
     if (!draft) return;
-    const byId = ingredientsById();
-    const costs = recipeCosts(draft, byId, Store.state.settings);
+    const costs = recipeCosts(draft, ingredientsById(), Store.state.settings);
     const res = await sizeHelperWeight(costs.baseWeight);
-    if (!res) return;
+    if (!res || !draft) return;
     draft.sizes.push({ id: uid(), label: res.label, multiplier: res.multiplier });
-    await saveNow();
+    commitDraft();
     render();
   },
 
@@ -1163,9 +1308,9 @@ const actions = {
   'pick-emoji': async () => {
     if (!draft) return;
     const emoji = await emojiModal(draft.emoji);
-    if (!emoji) return;
+    if (!emoji || !draft) return;
     draft.emoji = emoji;
-    await saveNow();
+    commitDraft();
     render();
   },
 
@@ -1176,19 +1321,20 @@ const actions = {
       title: t('confirmDeleteCakeTitle'),
       text: t('confirmDeleteCakeText', { name }),
       confirmLabel: t('delete'),
-      danger: true,
     });
-    if (!ok) return;
+    if (!ok || !draft) return;
     const id = draft.id;
+    clearTimeout(saveTimer);
+    saveTimer = null;
     draft = null;
-    await Store.deleteRecipe(id);
+    Store.deleteRecipe(id);
     navigate('#/cakes');
   },
 
   'ing-new': async () => {
     const ing = await ingredientModal(null);
     if (!ing) return;
-    await Store.saveIngredient(ing);
+    Store.saveIngredient(ing);
     render();
   },
 
@@ -1197,7 +1343,7 @@ const actions = {
     if (!existing) return;
     const ing = await ingredientModal(existing);
     if (!ing) return;
-    await Store.saveIngredient(ing);
+    Store.saveIngredient(ing);
     render();
   },
 
@@ -1214,10 +1360,9 @@ const actions = {
       title: t('confirmDeleteIngTitle'),
       text,
       confirmLabel: t('delete'),
-      danger: true,
     });
     if (!ok) return;
-    await Store.deleteIngredient(ing.id);
+    Store.deleteIngredient(ing.id);
     render();
   },
 
@@ -1238,6 +1383,7 @@ const actions = {
     });
     if (!ok) return;
     migrationChecked = false;
+    flushDraft();
     await Store.signOut();
   },
 };
@@ -1245,10 +1391,14 @@ const actions = {
 document.addEventListener('click', (e) => {
   const el = e.target.closest('[data-action]');
   if (!el) return;
-  const fn = actions[el.dataset.action];
-  if (fn) {
-    if (el.tagName === 'A') e.preventDefault?.call(e); // anchors: let hash update happen naturally
-    fn(el);
+  const name = el.dataset.action;
+  const fn = actions[name];
+  if (!fn) return;
+  if (inFlight.has(name)) return;
+  const result = fn(el);
+  if (result && typeof result.then === 'function') {
+    inFlight.add(name);
+    result.finally(() => inFlight.delete(name));
   }
 });
 
@@ -1265,12 +1415,17 @@ main.addEventListener('input', (e) => {
 
   if (el.dataset.recipeField && draft) {
     const f = el.dataset.recipeField;
-    if (f === 'name') draft.name = el.value;
-    else if (f === 'marginPct') {
+    if (f === 'name') {
+      draft.name = el.value;
+    } else if (f === 'marginPct') {
       const n = parseNum(el.value);
-      draft.marginPct = el.value.trim() === '' ? null : n ?? 0;
+      // Empty means "use the default"; unparseable text keeps the old value.
+      if (el.value.trim() === '') draft.marginPct = null;
+      else if (n !== null) draft.marginPct = Math.max(0, n);
     } else {
-      draft[f] = parseNum(el.value) ?? 0;
+      const n = parseNum(el.value);
+      if (el.value.trim() === '') draft[f] = 0;
+      else if (n !== null) draft[f] = Math.max(0, n);
     }
     scheduleSave();
     updateComputed();
@@ -1278,11 +1433,12 @@ main.addEventListener('input', (e) => {
   }
 
   if (el.dataset.itemField && draft) {
-    const i = Number(el.dataset.index);
-    const item = draft.items?.[i];
+    const item = draftItem(el.dataset.itemId);
     if (!item) return;
     if (el.dataset.itemField === 'qty') {
-      item.qty = parseNum(el.value) ?? 0;
+      const n = parseNum(el.value);
+      if (el.value.trim() === '') item.qty = 0;
+      else if (n !== null) item.qty = Math.max(0, n);
       scheduleSave();
       updateComputed();
     }
@@ -1290,8 +1446,7 @@ main.addEventListener('input', (e) => {
   }
 
   if (el.dataset.sizeField && draft) {
-    const i = Number(el.dataset.index);
-    const size = draft.sizes?.[i];
+    const size = draftSize(el.dataset.sizeId);
     if (!size) return;
     if (el.dataset.sizeField === 'label') size.label = el.value;
     else if (el.dataset.sizeField === 'multiplier') {
@@ -1304,12 +1459,11 @@ main.addEventListener('input', (e) => {
 });
 
 // selects & settings commit on change
-main.addEventListener('change', async (e) => {
+main.addEventListener('change', (e) => {
   const el = e.target;
 
   if (el.dataset.itemField && draft) {
-    const i = Number(el.dataset.index);
-    const item = draft.items?.[i];
+    const item = draftItem(el.dataset.itemId);
     if (!item) return;
     if (el.dataset.itemField === 'ingredientId') {
       item.ingredientId = el.value;
@@ -1318,51 +1472,86 @@ main.addEventListener('change', async (e) => {
         const units = compatibleUnits(ing.packUnit);
         if (!units.includes(item.unit)) item.unit = units[0];
       }
-      await saveNow();
+      commitDraft();
       render();
     } else if (el.dataset.itemField === 'unit') {
       item.unit = el.value;
-      await saveNow();
+      commitDraft();
       updateComputed();
     }
     return;
   }
 
   if (el.dataset.setting) {
-    const n = parseNum(el.value) ?? 0;
-    // No render() here: it would rebuild the form and steal focus from the
-    // field the user just tabbed/clicked into. Inputs already show the value.
-    await Store.saveSettings({ [el.dataset.setting]: n });
+    const n = parseNum(el.value);
+    const value = el.value.trim() === '' ? 0 : n === null ? null : Math.max(0, n);
+    // Unparseable text: leave the stored value alone rather than zeroing it.
+    if (value === null) return;
+    Store.saveSettings({ [el.dataset.setting]: value });
   }
 });
 
 // ---------------- boot ----------------
 
 let bootRendered = false;
+let renderPending = false;
 
-function onStoreChange() {
-  updateModeBadge();
-  maybeOfferMigration();
-
-  // Don't yank the DOM out from under a focused field (cloud snapshot echoes).
+function isTypingInMain() {
   const ae = document.activeElement;
-  const typing =
+  return !!(
     ae &&
     main.contains(ae) &&
-    (ae.tagName === 'INPUT' || ae.tagName === 'SELECT' || ae.tagName === 'TEXTAREA');
-  if (typing && bootRendered) return;
+    (ae.tagName === 'INPUT' || ae.tagName === 'SELECT' || ae.tagName === 'TEXTAREA')
+  );
+}
+
+function onStoreChange() {
+  if (!topnav.hidden) updateModeBadge();
+  maybeOfferMigration();
+
+  // Don't yank the DOM out from under a focused field (cloud snapshot echoes);
+  // remember that a render is owed and run it once focus leaves.
+  if (isTypingInMain() && bootRendered) {
+    renderPending = true;
+    return;
+  }
 
   bootRendered = true;
+  renderPending = false;
   render();
 }
 
-window.addEventListener('hashchange', render);
+document.addEventListener('focusout', () => {
+  if (!renderPending) return;
+  // Let focus settle: it may just be moving to another field.
+  setTimeout(() => {
+    if (renderPending && !isTypingInMain()) {
+      renderPending = false;
+      flushDraft();
+      render();
+    }
+  }, 150);
+});
+
+// Leaving the editor must not lose a pending debounced save.
+window.addEventListener('beforeunload', flushDraft);
+window.addEventListener('pagehide', flushDraft);
+
+window.addEventListener('hashchange', () => {
+  // A modal belongs to the view that opened it.
+  closeModal(null);
+  render();
+});
 
 applyStaticI18n();
 Store.init({
   onChange: onStoreChange,
   onAuthChange: () => {
     migrationChecked = false;
+    draft = null;
     render();
+  },
+  onError: (kind) => {
+    if (kind === 'save') showToast(t('saveError'));
   },
 });

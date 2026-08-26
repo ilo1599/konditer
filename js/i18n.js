@@ -80,13 +80,18 @@ const dict = {
     rowIngredients: 'Ингредиенты',
     rowPackaging: 'Упаковка',
     rowLabor: 'Работа ({n} мин)',
-    rowFullCost: 'Себестоимость',
+    rowFullCost: 'Итого себестоимость',
     rowPrice: 'Рекомендуемая цена',
     rowWeight: 'Вес',
     rowCostPerKg: 'Себестоимость за кг',
     summaryNote: 'Цена = себестоимость + наценка {n}%.',
     summaryNoMargin: 'Наценка не задана — рекомендуемая цена равна себестоимости. Задайте наценку в настройках или в разделе «Дополнительно».',
+    weightApprox: 'Вес указан примерно: для ингредиентов в штуках заполните «Вес 1 шт» в разделе «Ингредиенты».',
     saved: 'Сохранено',
+    saveError: 'Не удалось сохранить. Проверьте соединение — изменения останутся на экране.',
+    loadError: 'Не удалось загрузить данные. Проверьте интернет и обновите страницу.',
+    cdnError: 'Не удалось подключиться к базе данных. Проверьте интернет и обновите страницу.',
+    reload: 'Обновить страницу',
 
     // ingredients
     ingredientsTitle: 'Ингредиенты',
@@ -103,9 +108,12 @@ const dict = {
     addIngredient: 'Добавить ингредиент',
     saveIngredient: 'Сохранить',
     confirmDeleteIngTitle: 'Удалить ингредиент?',
-    confirmDeleteIngText: '«{name}» будет удалён.',
-    confirmDeleteIngUsed: '«{name}» используется: {usage}. В этих рецептах он будет помечен как удалённый.',
+    confirmDeleteIngText: 'Ингредиент «{name}» будет удалён.',
+    confirmDeleteIngUsed: 'Ингредиент «{name}» используется {usage}. В этих рецептах он будет помечен как удалённый.',
     usageIn: { one: 'в {n} рецепте', few: 'в {n} рецептах', many: 'в {n} рецептах' },
+    ingFormError: 'Заполните название, количество в упаковке и цену.',
+    gramsPerPiece: 'Вес 1 шт, г',
+    gramsPerPieceHint: 'Нужен только для расчёта веса торта. Напр. яйцо — 55 г. Можно оставить пустым.',
 
     // settings
     settingsTitle: 'Настройки',
@@ -152,10 +160,15 @@ const dict = {
     migrateText: 'Здесь сохранены рецепты из локального режима. Перенести их в облачный аккаунт?',
     migrateYes: 'Перенести',
     migrateNo: 'Не переносить',
+    migrateLater: 'Спросить позже',
     migrateDone: 'Данные перенесены в облако',
 
     // emoji picker
     emojiPickerTitle: 'Значок торта',
+
+    // aria
+    ariaMainNav: 'Основная навигация',
+    ariaLoading: 'Загрузка',
 
     // misc
     cancel: 'Отмена',
@@ -241,7 +254,12 @@ const dict = {
     rowCostPerKg: 'Cost per kg',
     summaryNote: 'Price = cost + {n}% margin.',
     summaryNoMargin: 'No margin set — the suggested price equals the cost. Set a margin in Settings or in “Extras”.',
+    weightApprox: 'Weight is approximate: fill in “Weight of 1 pc” for piece-counted ingredients.',
     saved: 'Saved',
+    saveError: 'Could not save. Check your connection — your changes stay on screen.',
+    loadError: 'Could not load your data. Check your internet and reload the page.',
+    cdnError: 'Could not connect to the database. Check your internet and reload the page.',
+    reload: 'Reload page',
 
     ingredientsTitle: 'Ingredients',
     newIngredient: 'New ingredient',
@@ -260,6 +278,9 @@ const dict = {
     confirmDeleteIngText: '“{name}” will be deleted.',
     confirmDeleteIngUsed: '“{name}” is used {usage}. It will be marked as deleted in those recipes.',
     usageIn: { one: 'in {n} recipe', many: 'in {n} recipes' },
+    ingFormError: 'Please fill in the name, pack size and price.',
+    gramsPerPiece: 'Weight of 1 pc, g',
+    gramsPerPieceHint: 'Only used to estimate cake weight. E.g. one egg ≈ 55 g. Can be left empty.',
 
     settingsTitle: 'Settings',
     languageBlock: 'Language',
@@ -303,9 +324,13 @@ const dict = {
     migrateText: 'There are recipes saved in local mode. Move them into your cloud account?',
     migrateYes: 'Move data',
     migrateNo: 'Don’t move',
+    migrateLater: 'Ask later',
     migrateDone: 'Data moved to the cloud',
 
     emojiPickerTitle: 'Cake icon',
+
+    ariaMainNav: 'Main navigation',
+    ariaLoading: 'Loading',
 
     cancel: 'Cancel',
     delete: 'Delete',

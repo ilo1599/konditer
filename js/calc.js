@@ -1,6 +1,7 @@
 // ============================================================
 // calc.js — pure cost-calculation logic. No DOM, no storage.
-// Money is handled in floating euros and rounded only for display.
+// Money is computed in euros and rounded to cents per displayed
+// component, so every visible row adds up to the visible total.
 // ============================================================
 
 // Unit definitions: factor converts the unit to its family base
@@ -19,6 +20,17 @@ export const UNIT_ORDER = ['g', 'kg', 'ml', 'l', 'pcs'];
 export function compatibleUnits(packUnit) {
   const fam = UNITS[packUnit]?.family;
   return UNIT_ORDER.filter((u) => UNITS[u].family === fam);
+}
+
+export function roundCents(value) {
+  if (!isFinite(value)) return 0;
+  return Math.round(value * 100) / 100;
+}
+
+// Non-negative number or 0. Used for user-entered money/time/percent.
+function atLeastZero(value) {
+  const n = Number(value);
+  return isFinite(n) && n > 0 ? n : 0;
 }
 
 // Price per base unit (per gram / per ml / per piece). null if not computable.
@@ -47,45 +59,64 @@ export function itemCost(item, ingredientsById) {
   return { cost: qty * iu.factor * per, warning: null };
 }
 
-// Approximate base weight of the recipe in grams.
-// Mass counts exactly; volume approximated 1 ml ≈ 1 g; pieces ignored.
-export function recipeBaseWeight(recipe) {
+// Approximate weight of the recipe in grams at multiplier 1.
+// Mass counts exactly; volume approximated 1 ml ≈ 1 g; pieces count only
+// when the ingredient declares gramsPerPiece (e.g. one egg ≈ 55 g).
+export function recipeBaseWeight(recipe, ingredientsById) {
   let grams = 0;
   for (const item of recipe.items || []) {
     const u = UNITS[item.unit];
     const qty = Number(item.qty);
     if (!u || !isFinite(qty) || qty <= 0) continue;
-    if (u.family === 'mass' || u.family === 'vol') grams += qty * u.factor;
+    if (u.family === 'mass' || u.family === 'vol') {
+      grams += qty * u.factor;
+    } else if (u.family === 'count') {
+      const per = Number(ingredientsById?.[item.ingredientId]?.gramsPerPiece);
+      if (isFinite(per) && per > 0) grams += qty * per;
+    }
   }
   return grams;
 }
 
+// True when the recipe has piece-counted items whose weight is unknown,
+// so the weight figures are understated and the UI should say so.
+export function hasUnweighedPieces(recipe, ingredientsById) {
+  return (recipe.items || []).some((item) => {
+    if (UNITS[item.unit]?.family !== 'count') return false;
+    const qty = Number(item.qty);
+    if (!isFinite(qty) || qty <= 0) return false;
+    const per = Number(ingredientsById?.[item.ingredientId]?.gramsPerPiece);
+    return !(isFinite(per) && per > 0);
+  });
+}
+
 // Full cost breakdown for a recipe.
 // settings: { laborRate, marginPct }
-// Returns {
-//   baseCost, baseWeight, warnings: [{index, warning}],
-//   sizes: [{ id, label, multiplier, rawCost, extrasCost, fullCost, price, weight }]
-// }
+// Every money figure is already rounded to cents and internally consistent:
+// rawCost is the sum of the rounded per-item costs, fullCost the sum of the
+// rounded components, so the displayed rows always add up.
 export function recipeCosts(recipe, ingredientsById, settings) {
-  let baseCost = 0;
   const warnings = [];
-  (recipe.items || []).forEach((item, index) => {
+  const baseItemCosts = (recipe.items || []).map((item, index) => {
     const r = itemCost(item, ingredientsById);
-    baseCost += r.cost;
     if (r.warning) warnings.push({ index, warning: r.warning });
+    return r.cost;
   });
 
-  const baseWeight = recipeBaseWeight(recipe);
+  const baseCost = roundCents(baseItemCosts.reduce((a, b) => a + roundCents(b), 0));
+  const baseWeight = recipeBaseWeight(recipe, ingredientsById);
 
-  const laborRate = Number(settings?.laborRate) || 0;
-  const laborMinutes = Number(recipe.laborMinutes) || 0;
-  const packagingCost = Number(recipe.packagingCost) || 0;
-  const extrasCost = packagingCost + (laborMinutes / 60) * laborRate;
+  const laborRate = atLeastZero(settings?.laborRate);
+  const laborMinutes = atLeastZero(recipe.laborMinutes);
+  const packagingCost = roundCents(atLeastZero(recipe.packagingCost));
+  const laborCost = roundCents((laborMinutes / 60) * laborRate);
+  const extrasCost = roundCents(packagingCost + laborCost);
 
-  const marginPct =
+  const marginRaw =
     recipe.marginPct === null || recipe.marginPct === undefined || recipe.marginPct === ''
-      ? Number(settings?.marginPct) || 0
-      : Number(recipe.marginPct) || 0;
+      ? settings?.marginPct
+      : recipe.marginPct;
+  const marginPct = atLeastZero(marginRaw);
 
   const sizeDefs =
     recipe.sizes && recipe.sizes.length
@@ -95,15 +126,21 @@ export function recipeCosts(recipe, ingredientsById, settings) {
   const sizes = sizeDefs.map((s) => {
     const k = Number(s.multiplier);
     const mult = isFinite(k) && k > 0 ? k : 1;
-    const rawCost = baseCost * mult;
+    // Sum of rounded scaled item costs, so the row breakdown adds up.
+    const rawCost = roundCents(
+      baseItemCosts.reduce((sum, c) => sum + roundCents(c * mult), 0)
+    );
     // Packaging and labor are per cake, not scaled by size.
-    const fullCost = rawCost + extrasCost;
-    const price = fullCost * (1 + marginPct / 100);
+    const fullCost = roundCents(rawCost + extrasCost);
+    const price = roundCents(fullCost * (1 + marginPct / 100));
     return {
       id: s.id,
       label: s.label,
       multiplier: mult,
       rawCost,
+      packagingCost,
+      laborCost,
+      laborMinutes,
       extrasCost,
       fullCost,
       price,
@@ -111,7 +148,7 @@ export function recipeCosts(recipe, ingredientsById, settings) {
     };
   });
 
-  return { baseCost, baseWeight, warnings, marginPct, sizes };
+  return { baseCost, baseWeight, warnings, marginPct, packagingCost, laborCost, laborMinutes, sizes };
 }
 
 // Multiplier from pan diameters (same height assumed): area ratio.
@@ -130,12 +167,19 @@ export function multiplierFromWeight(baseWeightG, targetWeightG) {
   return b / a;
 }
 
-// Parse a user-entered number: accepts "1,5" and "1.5"; returns null if invalid.
+// Parse a user-entered number: accepts "1,5", "1.5", "30 %", "2,50 €".
+// Returns null when the text holds no usable number, so callers can keep
+// the previous value instead of silently substituting 0.
 export function parseNum(value) {
   if (typeof value === 'number') return isFinite(value) ? value : null;
   if (value === null || value === undefined) return null;
-  const s = String(value).trim().replace(/\s+/g, '').replace(',', '.');
+  const s = String(value)
+    .trim()
+    .replace(/[\s ]/g, '')
+    .replace(/[%€$£]/g, '')
+    .replace(',', '.');
   if (s === '') return null;
+  if (!/^[+-]?\d*\.?\d+$/.test(s)) return null;
   const n = Number(s);
   return isFinite(n) ? n : null;
 }
