@@ -20,4 +20,10 @@
 // };
 // ============================================================
 
-window.FIREBASE_CONFIG = null;
+window.FIREBASE_CONFIG = {
+  apiKey: "AIzaSyCkYHlnDDbvF4r2-FLOVju2eBRDwzN5Qqo",
+  authDomain: "konditer-24f1b.firebaseapp.com",
+  projectId: "konditer-24f1b",
+  storageBucket: "konditer-24f1b.firebasestorage.app",
+  messagingSenderId: "33677751695",
+  appId: "1:33677751695:web:a9698c961e520ba1edc7fa"};
